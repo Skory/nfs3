@@ -14,6 +14,12 @@ use crate::xdr_codec::Decoder;
 /// in one allocation.
 const EAGER_RESERVE: usize = 1024 * 1024 + 4096;
 
+/// Maximum number of RFC 5531 record-marking fragments accepted in one RPC record.
+///
+/// Prevents a peer from holding a connection open indefinitely with an endless
+/// stream of zero-length continuation fragments.
+const MAX_FRAGMENTS: usize = 256;
+
 /// Receive buffer that reassembles one RPC record (RFC 5531 record marking).
 ///
 /// The caller does the I/O: it passes each fragment marker to
@@ -29,6 +35,7 @@ const EAGER_RESERVE: usize = 1024 * 1024 + 4096;
 pub struct RecordBuf {
     buf: BytesMut,
     fragment_end: usize,
+    fragments: usize,
     last: bool,
     max_len: usize,
 }
@@ -40,6 +47,7 @@ impl RecordBuf {
         Self {
             buf: BytesMut::new(),
             fragment_end: 0,
+            fragments: 0,
             last: false,
             max_len,
         }
@@ -50,7 +58,7 @@ impl RecordBuf {
     /// # Errors
     ///
     /// Fails with [`io::ErrorKind::InvalidData`] if the record would exceed the
-    /// size limit.
+    /// size limit or the fragment count limit.
     ///
     /// # Panics
     ///
@@ -60,6 +68,12 @@ impl RecordBuf {
             !self.last && self.buf.len() == self.fragment_end,
             "previous fragment is incomplete or was the last"
         );
+        if self.fragments >= MAX_FRAGMENTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RPC record exceeds the fragment limit",
+            ));
+        }
         let header = fragment_header::from(marker);
         self.fragment_end = self
             .buf
@@ -72,6 +86,7 @@ impl RecordBuf {
                     "RPC record exceeds the size limit",
                 )
             })?;
+        self.fragments += 1;
         self.last = header.eof();
         Ok(())
     }
@@ -119,7 +134,7 @@ impl RecordBuf {
 mod tests {
     use bytes::BufMut;
 
-    use super::{EAGER_RESERVE, RecordBuf, io};
+    use super::{EAGER_RESERVE, MAX_FRAGMENTS, RecordBuf, io};
 
     #[test]
     fn eager_reservation_is_capped_and_then_grows_with_data() {
@@ -167,5 +182,22 @@ mod tests {
         record.buf_mut().unwrap().get_mut().extend_from_slice(b"ab");
         assert!(record.buf_mut().is_none());
         assert!(!record.is_complete());
+    }
+
+    #[test]
+    fn rejects_excessive_zero_length_fragments() {
+        let mut record = RecordBuf::new(usize::MAX);
+        for _ in 0..MAX_FRAGMENTS - 1 {
+            record.start_fragment([0, 0, 0, 0]).unwrap();
+        }
+        record.start_fragment([0x80, 0, 0, 0]).unwrap();
+        assert!(record.is_complete());
+
+        let mut record = RecordBuf::new(usize::MAX);
+        for _ in 0..MAX_FRAGMENTS {
+            record.start_fragment([0, 0, 0, 0]).unwrap();
+        }
+        let err = record.start_fragment([0x80, 0, 0, 0]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

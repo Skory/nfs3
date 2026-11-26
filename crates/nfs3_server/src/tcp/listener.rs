@@ -125,9 +125,13 @@ impl<T: NfsFileSystem + 'static> NFSTcp for NFSTcpListener<T> {
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
             let max_rpc_record_size = self.max_rpc_record_size;
+            let stop = Arc::clone(&self.stop_notify);
             tokio::spawn(async move {
                 let _ = socket.set_nodelay(true);
-                let _ = process_socket(socket, context, max_rpc_record_size).await;
+                tokio::select! {
+                    _ = process_socket(socket, context, max_rpc_record_size) => {}
+                    () = stop.notified() => {}
+                }
             });
         }
     }

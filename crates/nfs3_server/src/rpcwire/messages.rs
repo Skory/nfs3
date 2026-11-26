@@ -159,6 +159,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_excessive_zero_length_fragments() {
+        let mut wire = Vec::with_capacity(258 * 4);
+        for _ in 0..256 {
+            wire.extend_from_slice(&0u32.to_be_bytes());
+        }
+        wire.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+
+        let err = RpcRecordReader::new(wire.as_slice(), NonZeroUsize::new(1024))
+            .read_record()
+            .unwrap_ready()
+            .expect_err("excessive zero-length fragments must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     fn fragment(data: &[u8], last: bool) -> Vec<u8> {
         let len = u32::try_from(data.len()).expect("fragment fits");
         let marker = if last { len | 0x8000_0000 } else { len };
